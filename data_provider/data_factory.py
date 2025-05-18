@@ -1,9 +1,10 @@
 from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_M4, PSMSegLoader, \
-    MSLSegLoader, SMAPSegLoader, SMDSegLoader, SWATSegLoader, UEAloader
+    MSLSegLoader, SMAPSegLoader, SMDSegLoader, SWATSegLoader, UEAloader, SaintHilaireDataset
 from data_provider.uea import collate_fn
 from torch.utils.data import DataLoader
 
 data_dict = {
+    'OURS': SaintHilaireDataset,
     'ETTh1': Dataset_ETT_hour,
     'ETTh2': Dataset_ETT_hour,
     'ETTm1': Dataset_ETT_minute,
@@ -64,17 +65,12 @@ def data_provider(args, flag):
     else:
         if args.data == 'm4':
             drop_last = False
+
         data_set = Data(
-            args = args,
             root_path=args.root_path,
             data_path=args.data_path,
             flag=flag,
-            size=[args.seq_len, args.label_len, args.pred_len],
-            features=args.features,
-            target=args.target,
-            timeenc=timeenc,
-            freq=freq,
-            seasonal_patterns=args.seasonal_patterns
+            size=[args.seq_len, args.label_len, args.pred_len]
         )
         print(flag, len(data_set))
         data_loader = DataLoader(

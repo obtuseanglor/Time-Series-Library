@@ -12,8 +12,475 @@ from data_provider.uea import subsample, interpolate_missing, Normalizer
 from sktime.datasets import load_from_tsfile_to_dataframe
 import warnings
 from utils.augmentation import run_augmentation_single
-
 warnings.filterwarnings('ignore')
+from dateutil import tz
+
+class Dataset_SaintHilaire10min(Dataset):
+    """
+    读取 Saint‑Hilaire 场站 10‑minute SCADA 数据（Excel），
+    支持：
+      • 按风机筛选 (T2 / T3 / T5 / T6)
+      • 剔除 LIST_STOPS 中的停机区间
+      • 单/多特征、标准化、时间特征编码
+    """
+    def __init__(self,
+                 root_path,
+                 data_path='SaintHilaire_SCADA.xlsx',
+                 flag='train',               # 'train' | 'val' | 'test'
+                 size=None,                  # [seq_len, label_len, pred_len]
+                 turbine_id='T2',
+                 features='S',               # 'S' | 'M' | 'MS'
+                 target='ACTIVE POWER [Watt]',
+                 scale=True,
+                 timeenc=0,                  # 0: 简单手工; 1: 调用 time_features()
+                 freq='10min',
+                 drop_stop=False,            # 是否剔除停机区间
+                 cp_curve_path='CP-CT.dat',  # 功率曲线文件（可选）
+                 load_cp_curve=False):
+        super().__init__()
+
+        # ---------- 序列长度 ----------
+        if size is None:
+            self.seq_len  = 6*24*4       # 6 天输入 (6*24h*4=576)
+            self.label_len = 24*4        # 1 天 label
+            self.pred_len  = 24*4        # 1 天预测
+        else:
+            self.seq_len, self.label_len, self.pred_len = size
+
+        assert flag in ['train', 'val', 'test']
+        self.set_type = {'train':0, 'val':1, 'test':2}[flag]
+
+        self.root_path = root_path
+        self.data_path = data_path
+        self.turbine_id = turbine_id
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+        self.drop_stop = drop_stop
+
+        # ---------- 读取主数据 ----------
+        self.__read_data__()
+
+        # ---------- (可选) 读取功率曲线 ----------
+        if load_cp_curve:
+            self.cp_curve = self.__read_cp_curve__(cp_curve_path)
+
+    # -------------------------------------------------------------
+    def __read_data__(self):
+        file = os.path.join(self.root_path, self.data_path)
+
+        # 1) 读 Excel 主表
+        df_raw = pd.read_excel(file, sheet_name='DATA_10MIN')
+
+        # 2) 过滤风机
+        df_raw = df_raw[df_raw['TURBINE NUMBER'].astype(str).str.strip() == self.turbine_id]
+
+        # 3) 处理时间列（Paris → aware → 可转 UTC）
+        paris = tz.gettz('Europe/Paris')
+        df_raw['DATE'] = pd.to_datetime(df_raw['DATE ']).dt.tz_localize('UTC')
+        # 如果希望统一为 UTC，可加 .dt.tz_convert('UTC')
+        df_raw = df_raw.set_index('DATE').sort_index()
+
+        # 4) （可选）剔除停机区间
+        if self.drop_stop:
+            stop_sheet = pd.read_excel(file, sheet_name='LIST_STOPS')
+            stop_sheet = stop_sheet[stop_sheet['TURBINE NUMBER'].astype(str).str.strip() == self.turbine_id]
+            # 将开始结束时间转为 tz‑aware
+            stop_sheet['START'] = pd.to_datetime(stop_sheet['START OF STOP']).dt.tz_localize(paris)
+            stop_sheet['END']   = pd.to_datetime(stop_sheet['END OF STOP']).dt.tz_localize(paris)
+            mask = pd.Series(True, index=df_raw.index)
+            for _, row in stop_sheet.iterrows():
+                mask[row['START']:row['END']] = False
+            df_raw = df_raw[mask]
+
+        # 5) 特征选择
+        if self.features in ['M', 'MS']:
+            # 去掉非数值或无需参与模型的列
+            drop_cols = ['ID', 'PROJECT NAME', 'MANUFACTURER',
+                         'TURBINE MODEL', 'TURBINE NUMBER']
+            cols_data = df_raw.columns.difference(drop_cols)
+            df_data = df_raw[cols_data]
+        else:            # 'S'
+            df_data = df_raw[[self.target]]
+
+        # 6) 划分训练/验证/测试（时间连续）
+        n = len(df_data)
+        train_end = int(n * 0.7)
+        val_end   = int(n * 0.85)
+        borders = [(0, train_end),
+                   (train_end - self.seq_len, val_end),
+                   (val_end - self.seq_len, n)]
+        border1, border2 = borders[self.set_type]
+
+        # 7) 标准化
+        self.scaler = StandardScaler()
+        if self.scale:
+            self.scaler.fit(df_data.iloc[borders[0][0]:borders[0][1]])
+            data = self.scaler.transform(df_data)
+        else:
+            data = df_data.values
+
+        # 8) 时间特征
+        if self.timeenc == 0:
+            data_stamp = time_features(df_raw.index, freq=self.freq)
+        else:
+            data_stamp = time_features(df_raw.index, freq=self.freq)  # 也可以换成其它实现
+        # 9) 最终切片
+        self.data_x = data[border1:border2]
+        self.data_y = data[border1:border2]
+        self.data_stamp = data_stamp[border1:border2]
+
+    # -------------------------------------------------------------
+    def __read_cp_curve__(self, cp_curve_path):
+        """
+        简单示例：读取 CP‑CT.dat，返回 pandas.DataFrame
+        文件格式（假设以空格分隔，首行为表头）:
+            WS  Power  Cp  Ct
+        """
+        f = os.path.join(self.root_path, cp_curve_path)
+        curve = pd.read_csv(f, sep=r'\s+', comment='#')
+        return curve
+
+    # ------------------ Dataset API ------------------------------
+    def __getitem__(self, idx):
+        s_begin = idx
+        s_end   = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end   = r_begin + self.label_len + self.pred_len
+
+        seq_x      = self.data_x[s_begin:s_end]
+        seq_y      = self.data_y[r_begin:r_end]
+        seq_x_mark = self.data_stamp[s_begin:s_end]
+        seq_y_mark = self.data_stamp[r_begin:r_end]
+
+        return (seq_x.astype(np.float32),
+                seq_y.astype(np.float32),
+                seq_x_mark.astype(np.float32),
+                seq_y_mark.astype(np.float32))
+
+    def __len__(self):
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
+
+
+
+# ----------------- 时间特征 -----------------
+def time_features(dates, freq='10min'):
+    """
+    返回 shape=(len(dates), 6)：
+    month / day / weekday / hour / minute(10min 桶) / year_sin_cos(可选)
+    """
+    df = pd.DataFrame(index=dates)
+    df['month']    = df.index.month
+    df['day']      = df.index.day
+    df['weekday']  = df.index.weekday
+    df['hour']     = df.index.hour
+    df['minute']   = (df.index.minute // 10)          # 10‑min 桶
+    # 可选的周期性特征（示例）:
+    # df['year_sin'] = np.sin(2*np.pi*df.index.dayofyear/365.25)
+    # df['year_cos'] = np.cos(2*np.pi*df.index.dayofyear/365.25)
+    return df.values.astype(np.float32)
+
+
+class SaintHilaireDataset_1(Dataset):
+    """
+    长序列预测通用 Dataset
+    - seq_len     : 编码器输入长度
+    - label_len   : 解码器已知部分长度（如果模型需要，如 Informer）
+    - pred_len    : 预测步长
+    - features    : 使用哪些输入特征列；'M' = 多变量, 'S' = 单变量
+    - target      : 预测目标列名
+    """
+    def __init__(self,
+                 root_path,
+                 data_path='SaintHilaire_SCADA.xlsx',
+                 flag='train',               # 'train' | 'val' | 'test'
+                 size=None,                  # [seq_len, label_len, pred_len]
+                 turbine_id='T2',
+                 features='S',               # 'S' | 'M' | 'MS'
+                 target='ACTIVE POWER [Watt]',
+                 scale=True,
+                 timeenc=0,                  # 0: 简单手工; 1: 调用 time_features()
+                 freq='10min',
+                 drop_stop=False,            # 是否剔除停机区间
+                 cp_curve_path='CP-CT.dat',  # 功率曲线文件（可选）
+                 load_cp_curve=False):
+        
+        super().__init__()
+        self.seq_len, self.label_len, self.pred_len = size[0], size[1], size[2]
+        self.features_mode, self.target_col = features, target
+
+        cols_keep = [
+            "DATE",                     # 时间索引
+            "WIND_SPEED",
+            "WIND_DIRECTION",
+            "EXTERNAL_TEMPERATURE",
+            "LOW_SPEED_SHAFT",
+            "HIGH_SPEED_SHAFT",
+            "PITCH_ANGLE",
+            "GENERATE_TORQUE",
+            "TARGETED_TORQUE",
+            "ACTIVE_POWER",             # 预测目标
+        ]
+
+        input_cols = [
+            "WIND_SPEED",
+            "WIND_DIRECTION",
+            "EXTERNAL_TEMPERATURE",
+            "LOW_SPEED_SHAFT",
+            "HIGH_SPEED_SHAFT",
+            "PITCH_ANGLE",
+            "GENERATE_TORQUE",
+            "TARGETED_TORQUE",
+        ]
+
+        # ---------- 1. 读 & 清洗 ----------
+        df = (
+            pd.read_csv(csv_path, encoding="utf-8-sig", usecols=cols_keep)   # ← 只留需要的列
+            .rename(columns=str.strip)
+            .drop_duplicates()
+        )
+
+
+        df["DATE"] = pd.to_datetime(df["DATE"])
+        df = df.sort_values("DATE").set_index("DATE")
+
+        # 把所有字符串列先去空格再转换为 category → one-hot（如果需要）
+        cat_cols = df.select_dtypes("object").columns
+        if len(cat_cols):
+            df[cat_cols] = df[cat_cols].apply(lambda s: s.str.strip())
+            df = pd.get_dummies(df, columns=cat_cols, drop_first=True)
+
+        # ---------- 2. 归一化（只对数值列；不包括时间索引） ----------
+        numeric_cols = input_cols + ["ACTIVE_POWER"]
+        if scaler is None:                # 只在第一次初始化 train 时建立 scaler
+            scaler = StandardScaler()
+            scaler.fit(df.iloc[: int(len(df) * train_split)][numeric_cols])
+        df[numeric_cols] = scaler.transform(df[numeric_cols])
+
+        # 保存 scaler 供外部复用
+        self.scaler = scaler
+
+        # ---------- 3. 划分数据段 ----------
+        n = len(df)
+        train_end = int(n * train_split)
+        val_end = int(n * (train_split + val_split))
+
+        if flag == "train":
+            self.data = df.iloc[: train_end]
+            self.start = 0
+        elif flag == "val":
+            self.data = df.iloc[train_end:val_end]
+            self.start = train_end
+        else:  # "test"
+            self.data = df.iloc[val_end:]
+            self.start = val_end
+
+        if features == "S":               # 单变量
+            self.cols_x = [target]
+        else:                             # 多变量
+            self.cols_x = list(df.columns)
+
+        # ---------- 4. 转成 numpy ----------
+        self.data_x = self.data[self.cols_x].values.astype(np.float32)
+        self.data_y = self.data[target].values.astype(np.float32).reshape(-1, 1)
+
+    # ---- 核心：滑动窗口 ----
+    def __len__(self):
+        # 每一次取 seq_len + pred_len 的窗口；label_len 用于 decoder 已知部分
+        return len(self.data_x) - (self.seq_len + self.pred_len) + 1
+
+    def __getitem__(self, idx):
+        seq_start = idx
+        seq_end = seq_start + self.seq_len
+        label_end = seq_end + self.pred_len
+
+        # encoder 输入
+        seq_x = self.data_x[seq_start:seq_end]
+
+        # decoder 输入（已知 label_len + pred_len，但模型常用前 label_len 作为已知）
+        seq_y = self.data_y[seq_end - self.label_len : label_end]
+
+        # 真实待预测 y （只取最后 pred_len）
+        target_y = self.data_y[seq_end : label_end]
+
+        return (
+            torch.from_numpy(seq_x),        # [seq_len, dim]
+            torch.from_numpy(seq_y),        # [label_len + pred_len, 1]
+            torch.from_numpy(target_y),     # [pred_len, 1]
+        )
+
+
+
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import List
+
+# def time_features_stamp(dates: pd.Series):
+#     """
+#     从 pandas 时间序列中提取时间特征：月、日、星期、小时
+#     返回 numpy array，shape=(len(dates), 4)
+#     """
+#     df_stamp = pd.DataFrame({
+#         'date': dates
+#     })
+#     df_stamp['month'] = df_stamp['date'].dt.month
+#     df_stamp['day'] = df_stamp['date'].dt.day
+#     df_stamp['weekday'] = df_stamp['date'].dt.weekday
+#     df_stamp['hour'] = df_stamp['date'].dt.hour
+#     return df_stamp[['month','day','weekday','hour']].values
+def time_features_stamp(dates: pd.Series):
+    df_stamp = pd.DataFrame({'date': dates})
+    # 编码小时
+    hour = df_stamp['date'].dt.hour
+    df_stamp['hour_sin'] = np.sin(2 * np.pi * hour / 24)
+    df_stamp['hour_cos'] = np.cos(2 * np.pi * hour / 24)
+    # 编码月份
+    month = df_stamp['date'].dt.month
+    df_stamp['month_sin'] = np.sin(2 * np.pi * (month - 1) / 12)
+    df_stamp['month_cos'] = np.cos(2 * np.pi * (month - 1) / 12)
+    return df_stamp[['hour_sin', 'hour_cos', 'month_sin', 'month_cos']].values
+
+class SaintHilaireDataset(Dataset):
+    """
+    只用 8 个数值特征 + 时间特征 → 预测 ACTIVE_POWER
+    预处理流程：
+      1. 整个文件读入 → **删除含 NaN 行**
+      2. 在训练段拟合 StandardScaler
+      3. transform 整个数据
+      4. 再切出 train/val/test
+    返回 (seq_x, seq_y, seq_x_mark, seq_y_mark)
+    """
+
+    input_cols: List[str] = [
+        "WIND_SPEED",         # 风速
+        "WIND_DIRECTION",   # 风向
+        "EXTERNAL_TEMPERATURE", # 外部温度
+        "LOW_SPEED_SHAFT",    # 低速轴
+        "HIGH_SPEED_SHAFT",   # 高速轴
+        "PITCH_ANGLE",      # 桨距角
+        "GENERATE_TORQUE",    # 发电扭矩
+        "TARGETED_TORQUE",    # 目标扭矩
+    ]
+
+    # 预测目标列
+    target_col: str = "ACTIVE_POWER"
+
+    def __init__(
+        self,
+        root_path: str,
+        data_path: str,
+        size: list,
+        flag: str = "train",
+        train_split: float = 0.7,
+        val_split: float = 0.1,
+        scale: bool = True,
+    ):
+        super().__init__()
+        assert flag in ["train", "val", "test"], "flag 必须是 'train' | 'val' | 'test'"
+        self.flag = flag
+        self.set_type = {"train": 0, "val": 1, "test": 2}[flag]
+
+        # 窗口长度配置
+        self.seq_len, self.label_len, self.pred_len = size
+        self.scale = scale
+        self.scaler = StandardScaler()
+
+        # 读取与预处理
+        self._read_data_(root_path, data_path, train_split, val_split)
+
+    def _read_data_(self, root_path: str, data_path: str, train_split: float, val_split: float):
+        """读取 csv 并完成缺失值剔除、时间排序、缩放与切片"""
+        full_path = os.path.join(root_path, data_path)
+        keep_cols = ["DATE", *self.input_cols, self.target_col]
+
+        # 1️⃣ 读取并初步处理 ---------------------------------------------------
+        df_raw = (
+            pd.read_csv(full_path, usecols=keep_cols, encoding="utf-8-sig")
+              .rename(columns=str.strip)         # 去除列名空格
+              .drop_duplicates()                 # 去重
+        )
+
+        # 转换日期列
+        df_raw["DATE"] = pd.to_datetime(df_raw["DATE"])
+        df_raw = df_raw.sort_values("DATE").reset_index(drop=True)
+
+        # **删除包含 NaN 的行**  —— 解决下游 NaN 问题
+        df_raw = df_raw.dropna().reset_index(drop=True)
+
+        # 2️⃣ 计算 train/val/test 边界 ----------------------------------------
+        n = len(df_raw)
+        train_end = int(n * train_split)
+        val_end = int(n * (train_split + val_split))
+        borders1 = [0, train_end, val_end]
+        borders2 = [train_end, val_end, n]
+        b1, b2 = borders1[self.set_type], borders2[self.set_type]
+
+        # 3️⃣ 标准化（可选） ---------------------------------------------------
+        num_df = df_raw[self.input_cols + [self.target_col]]
+
+        if self.scale:
+            # 仅用训练段统计 μ、σ，防止信息泄露
+            train_slice = num_df.iloc[borders1[0]:borders2[0]]
+            self.scaler.fit(train_slice.values)
+            data_all = self.scaler.transform(num_df.values)
+        else:
+            data_all = num_df.values
+
+        # 4️⃣ 切片当前 flag 段 -------------------------------------------------
+        slice_data = data_all[b1:b2]
+        self.data_x = slice_data[:, : len(self.input_cols)].astype(np.float32)
+        self.data_y = slice_data[:, -1:].astype(np.float32)  # 形状 (N,1)
+
+        # 5️⃣ 构造时间特征 -----------------------------------------------------
+        dates = df_raw["DATE"].iloc[b1:b2]
+        self.data_stamp = time_features_stamp(dates)  # 用户提供该函数
+
+    # ----------------------------------------------------------------------
+    # Dataset 接口实现
+    # ----------------------------------------------------------------------
+    def __len__(self):
+        return len(self.data_x) - (self.seq_len + self.pred_len) + 1
+
+    def __getitem__(self, idx: int):
+        s = idx
+        e = s + self.seq_len
+        r_start = e - self.label_len
+        r_end = r_start + self.label_len + self.pred_len
+
+        seq_x = self.data_x[s:e]                    # 形状 [seq_len, 8]
+        seq_y = self.data_y[r_start:r_end]          # 形状 [label_len+pred_len, 1]
+        seq_x_mark = self.data_stamp[s:e]           # 时间特征 [seq_len, ?]
+        seq_y_mark = self.data_stamp[r_start:r_end] # 时间特征 [label_len+pred_len, ?]
+
+        return (
+            torch.from_numpy(seq_x),
+            torch.from_numpy(seq_y),
+            torch.from_numpy(seq_x_mark),
+            torch.from_numpy(seq_y_mark),
+        )
+
+    # ----------------------------------------------------------------------
+    # Utilities
+    # ----------------------------------------------------------------------
+    def inverse_transform(self, data: np.ndarray):
+        """将预测输出从标准化域映射回原始单位（只针对 target）"""
+        dummy = np.zeros((*data.shape[:-1], len(self.input_cols) + 1))
+        dummy[..., -1:] = data
+        inv = self.scaler.inverse_transform(dummy.reshape(-1, dummy.shape[-1]))[:, -1]
+        return inv.reshape(data.shape)
+
+
+
 
 
 class Dataset_ETT_hour(Dataset):
